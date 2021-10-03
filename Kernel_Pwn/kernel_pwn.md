@@ -1,6 +1,6 @@
+[TOC]
+
 # 基础知识
-
-
 
 ## 状态切换
 
@@ -46,8 +46,6 @@ sub $(6*8), %rsp      /* pt_regs->bp, bx, r12-15 not saved */
 
 > - 程序执行这条iret指令时，首先会从内核栈里弹出先前保存的被打断的程序的现场信息，即eflags，cs，eip重新开始执行；
 > - 如果存在特权级转换（从内核态转换到用户态），则还需要从内核栈中弹出用户态栈的ss和esp，这样也意味着栈也被切换回原先使用的用户态的栈了；
-
-
 
 
 
@@ -129,9 +127,467 @@ LKM一般是实现对某些硬件的管控(驱动)向上提供接口，所以其
 
 
 
-粗略的说LKM相比于普通ELF程序(linux下)就是多了一些模块函数，没了main函数
+拿设备驱动为例：`insmod`加载驱动的时候，内核调用`module_init()`函数，`module_init()`函数再调用`misc_register()`来向内核注册驱动
+
+```c
+struct miscdevice  {
+	int minor;
+	const char *name;
+	const struct file_operations *fops;
+	struct list_head list;
+	struct device *parent;
+	struct device *this_device;
+	const struct attribute_group **groups;
+	const char *nodename;
+	umode_t mode;
+};
+int misc_register(struct miscdevice *misc);
+```
 
 
+
+其中比较重要的file_operations结构体为：包含了对设备的各种操作的函数
+
+```c
+struct file_operations {
+	struct module *owner;
+	loff_t (*llseek) (struct file *, loff_t, int);
+	ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
+	ssize_t (*write_iter) (struct kiocb *, struct iov_iter *);
+	int (*iopoll)(struct kiocb *kiocb, bool spin);
+	int (*iterate) (struct file *, struct dir_context *);
+	int (*iterate_shared) (struct file *, struct dir_context *);
+	__poll_t (*poll) (struct file *, struct poll_table_struct *);
+	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
+	int (*mmap) (struct file *, struct vm_area_struct *);
+	unsigned long mmap_supported_flags;
+	int (*open) (struct inode *, struct file *);
+	int (*flush) (struct file *, fl_owner_t id);
+	int (*release) (struct inode *, struct file *);
+	int (*fsync) (struct file *, loff_t, loff_t, int datasync);
+	int (*fasync) (int, struct file *, int);
+	int (*lock) (struct file *, int, struct file_lock *);
+	ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int);
+	unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+	int (*check_flags)(int);
+	int (*flock) (struct file *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	int (*setlease)(struct file *, long, struct file_lock **, void **);
+	long (*fallocate)(struct file *file, int mode, loff_t offset,
+			  loff_t len);
+	void (*show_fdinfo)(struct seq_file *m, struct file *f);
+#ifndef CONFIG_MMU
+	unsigned (*mmap_capabilities)(struct file *);
+#endif
+	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *,
+			loff_t, size_t, unsigned int);
+	loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in,
+				   struct file *file_out, loff_t pos_out,
+				   loff_t len, unsigned int remap_flags);
+	int (*fadvise)(struct file *, loff_t, loff_t, int);
+} __randomize_layout;
+```
+
+通过修改结构体中对应指针来达到**重写某个函数的目的**，如果对这个驱动调用某个其中的函数，就会调用结构体中的函数指针。
+
+如某个内核模块代码中：
+
+```c
+struct file_operations shf_fops = {
+.owner = THIS_MODULE,
+.open = shf_open,
+.release = shf_release,
+.unlocked_ioctl = shf_unlocked_ioctrl,
+}
+struct miscdevice shf_device = {
+.minor = MISC_DYNAMIC_MINOR,
+.name = "shf",
+.fops = &shf_fops,
+};
+misc_regiseter(&shf_device); 
+```
+
+重写了`open`,`release`,`unlocked_ioctl`函数，设备名为`shf`那么`misc_regiseter`函数会在/dev下创建shf节点，即/dev/shf
+
+
+
+> 来聊聊ioctl():
+> ioctl函数是文件结构中的一个属性分量，就是说如果你的驱动程序提供了对ioctl的支持，用户就可以在用户程序中使用ioctl函数来控制设备的I/O通道，它需要传递三个参数，包含文件动态信息的文件结构体，命令以及参数。第一个在应用程序里反映的就是文件描述符，cmd则是判断语句里需要用到的，linux为cmd设计了具体的规则以及命令生成函数以便于程序人员开发自己的命令，第三个参数就用来传递参数，既可以传递整数也可以传递指针，但是指针的传递需要在程序里面进行检验，否则有可能造成系统奔溃。
+
+在用户程序中只要`fd = open("/dev/shf",READONY);`就可以调用重写的`open`函数来启动该驱动，然后通过`ioctl`函数操作该驱动
+
+最后会到**vfs_ioctl**：**filp对应fd索引的文件描述表项**
+
+```c
+long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int error = -ENOTTY;
+	if (!filp->f_op->unlocked_ioctl)
+		goto out;
+	error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
+	if (error == -ENOIOCTLCMD)
+		error = -ENOTTY;
+ out:
+	return error;
+}
+EXPORT_SYMBOL(vfs_ioctl);
+struct file {
+	union {
+		struct llist_node	fu_llist;
+		struct rcu_head 	fu_rcuhead;
+	} f_u;
+	struct path		f_path;
+	struct inode		*f_inode;	/* cached value */
+	const struct file_operations	*f_op;
+	...
+}
+```
+
+该函数检查是否有hook函数也就是前面重写的处理函数，然后调用该函数
+
+对于设备`open`、`read`、`write`等系统调用的大致流程也都是如此
+
+![](kernel_pwn.assets/3045403722-5f3e0eee99743.png)
+
+
+
+实例：通过内核驱动程序，在安卓终端实现加减运算 
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/cdev.h>
+#include <linux/fs.h>        //函數指針存放
+#include <linux/device.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
+#include <linux/kernel.h>
+#include "in_proc.h"
+
+
+//指定的主设备号
+#define MAJOR_NUM 250
+/*
+struct cdev {
+    struct kobject kobj;
+    struct module *owner;
+    const struct file_operations *ops;
+    struct list_head list;
+    dev_t dev;
+    unsigned int count;
+};
+ */
+//注册自己的设备号
+
+struct mycdev {      
+    int len;
+    unsigned int buffer[50];
+    struct cdev cdev;
+};
+
+MODULE_LICENSE("GPL");     //許可說明
+
+//设备号
+static dev_t dev_num = {0};
+
+//全局gcd
+struct mycdev *gcd;
+
+//设备类
+struct class *cls;
+
+//获得用户传递的数据，根据它来决定注册的设备个数
+static int ndevices = 1;
+module_param(ndevices, int, 0644);
+MODULE_PARM_DESC(ndevices, "The number of devices for register.\n");
+
+
+//打开设备
+static int dev_fifo_open(struct inode *inode, struct file *file)
+{
+    
+    struct mycdev *cd;
+    
+    //用struct file的文件私有数据指针保存struct mycdev结构体指针
+    cd = container_of(inode->i_cdev,struct mycdev,cdev);   //该函数可以根据结构体成员获取结构体地址
+    file->private_data = cd;
+    printk( KERN_CRIT "open success!\n");
+
+    return 0;
+}
+
+//读设备
+static ssize_t dev_fifo_read(struct file *file, char __user *ubuf, size_t size, loff_t *ppos)
+{
+    int n ;
+    int ret;
+    unsigned int *kbuf;
+    struct mycdev *mycd = file->private_data;
+    
+    //printk(KERN_CRIT "read *ppos : %lld\n",*ppos);    //光标位置
+
+    if(*ppos == mycd->len)
+        return 0;
+
+    //请求大小 > buffer剩余的字节数 :读取实际记的字节数
+    if(size > mycd->len - *ppos)
+        n = mycd->len - *ppos;
+    else
+        n = size;
+
+    //从上一次文件位置指针的位置开始读取数据
+    kbuf = mycd->buffer+*ppos;
+    //拷贝数据到用户空间
+    ret = copy_to_user(ubuf,kbuf,n*sizeof(kbuf));
+    if(ret != 0)
+        return -EFAULT;
+    
+    //更新文件位置指针的值
+    *ppos += n;
+    
+    printk(KERN_CRIT "dev_fifo_read success!\n");
+
+    return n;
+}
+
+//写设备
+static ssize_t dev_fifo_write(struct file *file, const char __user *ubuf, size_t size, loff_t *ppos)
+{
+    int n;
+    int ret;
+    unsigned int *kbuf;
+    struct mycdev *mycd = file->private_data;
+
+    printk("write *ppos : %lld\n",*ppos);
+    
+    //已经到达buffer尾部了
+    if(*ppos == sizeof(mycd->buffer))
+        return -1;
+
+    //请求大小 > buffer剩余的字节数(有多少空间就写多少数据)
+    if(size > sizeof(mycd->buffer) - *ppos)
+        n = sizeof(mycd->buffer) - *ppos;
+    else
+        n = size;
+
+    //从上一次文件位置指针的位置开始写入数据
+    kbuf = mycd->buffer + *ppos;
+
+    //拷贝数据到内核空间
+    ret = copy_from_user(kbuf, ubuf, n*sizeof(ubuf));
+    if(ret != 0)
+        return -EFAULT;
+
+    //更新文件位置指针的值
+    *ppos += n;
+    
+    //更新dev_fifo.len
+    mycd->len += n;
+
+    printk("dev_fifo_write success!\n");
+    return n;
+}
+
+//linux 内核在2.6以后，已经废弃了ioctl函数指针结构，取而代之的是unlocked_ioctl
+long dev_fifo_unlocked_ioctl(struct file *file, unsigned int cmd,unsigned long arg)
+{
+    int ret = 0;
+    struct mycdev *mycd = file->private_data;
+
+    struct ioctl_data val;    //定义结构体
+
+    printk( KERN_CRIT "in dev_fifo_ioctl,sucessful!\n");
+
+    if(_IOC_TYPE(cmd) != DEV_FIFO_TYPE)     //检测命令
+        {
+            printk(KERN_CRIT "CMD ERROR\n");
+            return -EINVAL;
+        }
+
+    /*if(_IOC_NR(cmd) > DEV_FIFO_NR)
+        {
+            printk(KERN_CRIT "CMD 1NUMBER ERROR\n");
+            return -EINVAL;
+        }*/
+    switch(cmd){
+        case DEV_FIFO_CLEAN:
+            printk("CMD:CLEAN\n");
+            memset(mycd->buffer, 0, sizeof(mycd->buffer));
+            break;
+
+        case DEV_FIFO_SETVALUE:
+            printk("CMD:SETVALUE\n");
+            mycd->len = arg;
+            break;
+
+        case DEV_FIFO_GETVALUE:
+            printk("CMD:GETVALUE\n");
+            ret = put_user(mycd->len, (int *)arg);
+            break;
+
+        case DEV_FIFO_SUM:       //求和
+            printk( KERN_CRIT "It is CMD:SUM!!!!\n");
+            //检查指针是否安全|获取arg传递地址
+            if(copy_from_user(&val,(struct ioctl_data*)arg,sizeof(struct ioctl_data))){
+                ret = -EFAULT;
+                goto RET;
+            }
+            //printk( KERN_CRIT "CMD:SUM!!!!!\n");
+            memset(mycd->buffer,0,DEV_SIZE);    //清空区域 
+            val.buf[1] = val.buf[0]+val.buf[2];   //计算结果
+            //printk(KERN_CRIT "result is %d\n",val.buf[1]);
+            memcpy(mycd->buffer,val.buf,sizeof(val.buf)*val.size);
+            /*for(i = 0;i < 50;i++)
+               printk( KERN_CRIT "%d\n",mycd->buffer[i]);*/
+            mycd->len = val.size;
+            file->f_pos = 0;
+            break;
+
+         case DEV_FIFO_DEC:       //求差
+            printk(KERN_CRIT "It is CMD:DEC!!!!\n");
+            //检查指针是否安全|获取arg传递地址
+            if(copy_from_user(&val,(struct ioctl_data*)arg,sizeof(struct ioctl_data))){
+                ret = -EFAULT;
+                goto RET;
+            }
+             memset(mycd->buffer,0,DEV_SIZE);    //清空区域 
+             val.buf[1] = val.buf[0]-val.buf[2];   //计算结果
+             memcpy(mycd->buffer,val.buf,sizeof(val.buf)*val.size);
+              /*printk(KERN_CRIT"size is :%d\n",val.size);
+              for(i = 0;i < 50;i++)
+               printk( KERN_CRIT "%d\n",mycd->buffer[i]);*/
+             mycd->len = val.size;
+             file->f_pos = 0;
+             break;
+
+        default:
+            return -EFAULT;      //错误指令
+    }
+    RET:
+    return ret;
+}
+
+
+//设备操作函数接口
+static const struct file_operations fifo_operations = {
+    .owner = THIS_MODULE,
+    .open = dev_fifo_open,
+    .read = dev_fifo_read,
+    .write = dev_fifo_write,
+    .compat_ioctl = dev_fifo_unlocked_ioctl,
+};
+
+
+//模块入口
+int __init dev_fifo_init(void)
+{
+    int i = 0;
+    int n = 0;
+    int ret;
+    struct device *device;
+    
+    gcd = kzalloc(ndevices * sizeof(struct mycdev), GFP_KERNEL);   //内核内存正常分配，可能通过睡眠来等待，此函数等同于kmalloc()
+    if(!gcd){
+        return -ENOMEM;    //內存溢出
+    }
+
+    //设备号 : 主设备号(12bit) | 次设备号(20bit)
+    dev_num = MKDEV(MAJOR_NUM, 0);
+
+    //静态注册设备号
+    ret = register_chrdev_region(dev_num,ndevices,"dev_fifo");   
+    if(ret < 0){
+
+        //静态注册失败，进行动态注册设备号
+        ret = alloc_chrdev_region(&dev_num,0,ndevices,"dev_fifo");
+        if(ret < 0){
+            printk("Fail to register_chrdev_region\n");
+            goto err_register_chrdev_region;
+        }
+    }
+    
+    //创建设备类
+    cls = class_create(THIS_MODULE, "dev_fifo");
+    if(IS_ERR(cls)){
+        ret = PTR_ERR(cls);
+        goto err_class_create;
+    }
+    
+    printk("ndevices : %d\n",ndevices);
+    
+    for(n = 0;n < ndevices;n ++){
+        //初始化字符设备
+        cdev_init(&gcd[n].cdev,&fifo_operations);
+
+        //添加设备到操作系统
+        ret = cdev_add(&gcd[n].cdev,dev_num + n,1);
+        if (ret < 0){
+            goto err_cdev_add;
+        }
+        //导出设备信息到用户空间(/sys/class/类名/设备名)
+        device = device_create(cls,NULL,dev_num + n,NULL,"dev_fifo%d",n);
+        if(IS_ERR(device)){
+            ret = PTR_ERR(device);
+            printk("Fail to device_create\n");
+            goto err_device_create;    
+        }
+    }
+    printk("Register dev_fito to system,ok!\n");
+
+    
+    return 0;
+
+err_device_create:
+    //将已经导出的设备信息除去
+    for(i = 0;i < n;i ++){
+        device_destroy(cls,dev_num + i);    
+    }
+
+err_cdev_add:
+    //将已经添加的全部除去
+    for(i = 0;i < n;i ++)
+    {
+        cdev_del(&gcd[i].cdev);
+    }
+
+err_class_create:
+    unregister_chrdev_region(dev_num, ndevices);
+
+err_register_chrdev_region:
+    return ret;
+
+}
+
+void __exit dev_fifo_exit(void)
+{
+    int i;
+
+    //删除sysfs文件系统中的设备
+    for(i = 0;i < ndevices;i ++){
+        device_destroy(cls,dev_num + i);    
+    }
+
+    //删除系统中的设备类
+    class_destroy(cls);
+ 
+    //从系统中删除添加的字符设备
+    for(i = 0;i < ndevices;i ++){
+        cdev_del(&gcd[i].cdev);
+    }
+    
+    //释放申请的设备号
+    unregister_chrdev_region(dev_num, ndevices);
+
+}
+
+
+module_init(dev_fifo_init);
+module_exit(dev_fifo_exit);
+```
 
 
 
@@ -149,38 +605,99 @@ LKM一般是实现对某些硬件的管控(驱动)向上提供接口，所以其
 
 
 
+绕过思路：
 
-
-# 例题解析
-
-题目给出**initramfs.cpio.gz**文件系统压缩文件
-
-解压脚本：
-
-```bash
-mkdir initramfs
-cd initramfs
-cp ../initramfs.cpio.gz .
-gunzip ./initramfs.cpio.gz
-cpio -idm < ./initramfs.cpio
-rm initramfs.cpio
-```
++ smep, smap:
+  + 通过kernel crash获取`CR4`的值（可以通过`kfree`一块非法内存，比如x86下`kfree(0xFFFFFFFF)`），然后将第二十个bit置0后，再通过gadget`mov`到`CR4`中。
+  + 或者用固定值0x6F0，即`mov cr4, 0x6f0`。
+  + 完全内核态Rop
++ smep: 用户空间提供rop地址，kernel跳转
 
 
 
-打包脚本：包括静态编译Exp
+## 内存管理 -- slab
 
-```c
-gcc -o exploit -static $1
-mv ./exploit ./initramfs
-cd initramfs
-find . -print0 \
-| cpio --null -ov --format=newc \
-| gzip -9 > initramfs.cpio.gz
-mv ./initramfs.cpio.gz ../
-```
+Linux采用伙伴算法(`buddy system`)来分配较大的内存块，使用slab算法管理分配小内存块
+
+如下伙伴算法示意图：
+
+<img src="kernel_pwn.assets/buddy-example.jpg" style="zoom: 80%;" />
+
+1. 初始状态
+2. 分配块A , order=0.
+   1. 没有order为0的块，切分order=4的块为2个order=3的块.
+   2. 仍然没有order=0的块，再切分order=3的块.
+   3. 仍然没有order=0的块，再切分order=2的块.
+   4. 仍然没有order=0的块，再切分order=1的块.
+   5. 将order=0的块返回.
+3. 分配块B, order=1. 已经有了，直接返回.
+4. 分配块C, order=0. 也已经有了，直接返回.
+5. 分配块D, order=1. 切分一个order=2的块，返回.
+6. 块B释放.
+7. 块D释放，因为与其后面的order=1的块是第5步分裂得来的，再将其合并为order=2的块.
+8. 块A释放.
+9. 块C释放，依次合并
+
+值得注意的是这样分配得到的**虚拟地址和物理地址**都是连续的
 
 
+
+slab系统从buddy system获取一页或多页连续内存，然后按slab需求分割成小份满足小内存请求
+
+![](kernel_pwn.assets/slab.png)
+
+每个`kmem_cache`由若干个slab构成，每个slab由一个或多个连续的页组成。`kmem_cache`有一个重要的性质，就是其中所有的object大小都是相同的（准确的说是分配块的大小都相同）.每个slab对象由object组成(小块内存)，free对象像tache构成单向链表
+
+<img src="kernel_pwn.assets/0_13206585969HzH (1).gif" style="zoom: 80%;" />
+
+堆块处理函数：
+
+- kmalloc：分配小块内存（不大于128k）由kfree释放，**物理地址连续**
+
+  - ```c
+    #define ___GFP_HIGH		0x20u
+    #define ___GFP_ATOMIC		0x200u
+    #define ___GFP_KSWAPD_RECLAIM	0x800u
+    #define ___GFP_IO		0x40u
+    #define ___GFP_FS		0x80u
+    #define ___GFP_DMA		0x01u
+    
+    #define __GFP_RECLAIM ((__force gfp_t)(___GFP_DIRECT_RECLAIM|___GFP_KSWAPD_RECLAIM))
+    #define GFP_ATOMIC	(__GFP_HIGH|__GFP_ATOMIC|__GFP_KSWAPD_RECLAIM)
+    #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
+    #define GFP_DMA		__GFP_DMA
+    
+    void *kmalloc(size_t size, gfp_t flags)；
+    /*
+    GFP_ATOMIC —— 分配内存的过程是一个原子过程，分配内存的过程不会被（高优先级进程或中断）打断；
+    GFP_KERNEL —— 正常分配内存；
+    GFP_DMA —— 给 DMA 控制器分配内存，需要使用该标志（DMA要求分配虚拟地址和物理地址连续）。
+    */
+    ```
+
+- kfree：
+
+  - ```c
+    void kfree(const void *objp);
+    /*该包装函数会先将内存清零*/
+    static inline void *kzalloc(size_t size, gfp_t flags){    
+        return kmalloc(size, flags | __GFP_ZERO);
+    }
+    ```
+
+- vmalloc：一般分配大块内存，物理地址不连续，vfree释放
+
+- vfree
+
+  - ```c
+    void *vmalloc(unsigned long size);
+    void vfree(const void *addr);
+    ```
+
+
+
+
+## Misc
 
 解压内核镜像文件**vmlinuz**：
 
@@ -245,10 +762,78 @@ try_decompress '\002!L\030'   xxx   'lz4 -d'
 try_decompress '(\265/\375'   xxx   unzstd
 
 # Finally check for uncompressed images or objects:
-check_vmlinux $img
+check_vm
+linux $img
 
 # Bail out:
 echo "$me: Cannot find vmlinux." >&2
+```
+
+
+
+确定当前`cred`结构体大小：关闭`kaslr`
+
+```bash
+/ # cat /proc/kallsyms | grep cred_init
+ffffffff81f7bf04 T cred_init
+```
+
+在IDA找到该函数：
+
+```c
+/* 
+ * initialise the credentials stuff 
+ */  
+void __init cred_init(void)  
+{  
+    /* allocate a slab in which we can store credentials */  
+    cred_jar = kmem_cache_create("cred_jar", sizeof(struct cred), 0,  
+            SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);  
+}  
+/*IDA*/
+__int64 sub_FFFFFFFF81870946()
+{
+  __int64 result; // rax
+
+  result = sub_FFFFFFFF81098CE0("cred_jar", 0x78LL, 0LL, 270336LL, 0LL);
+  qword_FFFFFFFF818F39E0 = result;
+  return result;
+}
+```
+
+
+
+`gdb`中使用`add-symbol-file ./babydriver.ko 0xffffffffc0000000`指定模块加载地址
+
+
+
+# 例题解析 --- hxpCTF 2020
+
+题目给出**initramfs.cpio.gz**文件系统压缩文件
+
+解压脚本：
+
+```bash
+mkdir initramfs
+cd initramfs
+cp ../initramfs.cpio.gz .
+gunzip ./initramfs.cpio.gz
+cpio -idm < ./initramfs.cpio
+rm initramfs.cpio
+```
+
+
+
+打包脚本：包括静态编译Exp
+
+```c
+gcc -o exploit -static $1
+mv ./exploit ./initramfs
+cd initramfs
+find . -print0 \
+| cpio --null -ov --format=newc \
+| gzip -9 > initramfs.cpio.gz
+mv ./initramfs.cpio.gz ../
 ```
 
 
@@ -551,9 +1136,7 @@ void escalate_privs(void){
 #include <unistd.h>
 #include <stdlib.h>
 
-
 int global_fd;
-
 void open_dev(){
     global_fd = open("/dev/hackme", O_RDWR);
 	if (global_fd < 0){
@@ -867,7 +1450,7 @@ void build_stack(){
 
 这里从**0x5b000000-0x1000**开始获取0x2000(两页)的空间(rwx)：0x5afff000 ~ 0x5b001000，这时为了防止ROP链在调用提权函数时`栈增长`，然后还需提前向**0x5b000000~0x5afff000**写入数据引发缺页写入页表
 
-
+对于`mov esp, 0x5b000000`语句会将rsp的高位置零看这里：[assembly - Why do x86-64 instructions on 32-bit registers zero the upper part of the full 64-bit register? - Stack Overflow](https://stackoverflow.com/questions/11177137/why-do-x86-64-instructions-on-32-bit-registers-zero-the-upper-part-of-the-full-6)
 
 Result:
 
@@ -1555,3 +2138,4 @@ Result：
 + 了解FG-Kaslr保护不受影响的代码区
 + 泄露**_text**基地址
 + 计算提权函数和需要的gadgets
+
