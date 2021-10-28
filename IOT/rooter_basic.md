@@ -66,3 +66,113 @@ ROM 是只读存储器（Read-Only Memory）的简称，需要用专门的软件
       + VxWorks系统：TP-Link
       + 基于Unix系统(linux, BSD)发开
       + 基于开源系统修改
+
+
+
+## 网络协议
+
+下面以一个TCP/IP 三次握手和四次挥手为例
+
+
+
+Server: 等待client连接并接收"AAAAA...."后发送"BBBBB...."
+
+```bash
+amd64@ubuntu:~$ nc -vvl 8848
+Listening on [0.0.0.0] (family 0, port 8848)
+Connection from [127.0.0.1] port 8848 [tcp/*] accepted (family 2, sport 38082)
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+```
+
+
+
+Send: 连接Server 并发送"AAAAA....." 接收Server的"BBBBB....."
+
+```bash
+amd64@ubuntu:~$ nc 127.0.0.1 8848
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+```
+
+
+
+使用tcpdump进行抓包：
+
+```bash
+sudo tcpdump -i lo -s0  -w ./tmp.pcap
+```
+
+WireShark析包：
+
+![image-20211028220051522](rooter_basic.assets/image-20211028220051522.png)
+
++ 可以看到前面三个包进行了三次握手：用于同步
+  + 同步两者的序号(seq) 和 窗口大小
++ 中间几次发包：数据传输
++ 最后四次挥手：断开连接
+
+
+
+### TCP header
+
+<img src="rooter_basic.assets/image-20211028221314912.png" alt="image-20211028221314912" style="zoom: 67%;" />
+
+从低到高依次为：
+
++ 发送方端口：16bits
++ 接收方端口：16bits
++ 发送数据的顺序编号：32bits
++ 接收数据的顺序编号：32bits
++ 数据偏移：4bits
+  + 数据部分(data)在包中的偏移，可以认为是头部大小
++ 保留位：3bits
++ flags：9bits
+  + SYN，FIN等
++ 窗口大小：16bits
+  + 接收方通知发送方自己的窗口大小(缓冲区空闲size)
++ 校验和：16bits
++ 紧急指针：16bits
++ 可选字段
+
+**所以一个TCP 头至少20bytes**
+
+
+
+### 包的发送与接收
+
+包含程序数据的包：
+
+<img src="rooter_basic.assets/image-20211028222558136.png" alt="image-20211028222558136" style="zoom:67%;" />
+
+以太网中一个网络包的最大长度一般为1500bytes(**MTU**)
+
+MSS：**除去头部**之后一个网络包所能包容的TCP数据的最大长度
+
+<img src="rooter_basic.assets/image-20211028222855149.png" alt="image-20211028222855149" style="zoom: 67%;" />
+
+如上例子中：
+
+数据包：
+
+<img src="rooter_basic.assets/image-20211028223236559.png" alt="image-20211028223236559" style="zoom:67%;" />
+
+TCP 头：OSI中对应传输层，主要负责通信双方应用程序的数据流，建立连接、发送数据以及断开连接
+
+<img src="rooter_basic.assets/image-20211028223434043.png" alt="image-20211028223434043" style="zoom:67%;" />
+
+IP头部：OSI中对应网络层，包含ip地址主要负责路由
+
+<img src="rooter_basic.assets/image-20211028223719871.png" alt="image-20211028223719871" style="zoom:67%;" />
+
+
+
+以太网头部：OSI中对应链路层，包含mac地址
+
+<img src="rooter_basic.assets/image-20211028224044317.png" alt="image-20211028224044317" style="zoom:67%;" />
+
+
+
+最后通过物理层：将整个数据包以比特流形式发送，也会有对应的协议
+
+<img src="rooter_basic.assets/image-20211028224511907.png" alt="image-20211028224511907" style="zoom: 67%;" />
